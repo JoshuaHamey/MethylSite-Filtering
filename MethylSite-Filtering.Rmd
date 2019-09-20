@@ -1,0 +1,651 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+##Loading packages
+
+library(tidyverse)
+library(matrixStats)
+library(splitstackshape)
+```
+
+```{r}
+##Reading MQ output files
+
+msms <- read.delim("msms.txt", stringsAsFactors=FALSE)
+
+MethylKSites <- read.delim("Methyl (K)Sites.txt", stringsAsFactors=FALSE)
+DimethylKSites <- read.delim("Dimethyl (K)Sites.txt", stringsAsFactors=FALSE)
+TrimethylKSites <- read.delim("Trimethyl (K)Sites.txt", stringsAsFactors=FALSE)
+
+Peptides <- read.delim("peptides.txt", stringsAsFactors=FALSE)
+
+```
+
+```{r}
+##Altering some columns names and adding columns to tables
+
+#Renaming ID columns
+names(msms)[names(msms) == "id"] <- "MS.MS.IDs"
+
+names(MethylKSites)[names(MethylKSites) == "id"] <- "MethylKSiteID"
+names(DimethylKSites)[names(DimethylKSites) == "id"] <- "DimethylKSiteID"
+names(TrimethylKSites)[names(TrimethylKSites) == "id"] <- "TrimethylKSiteID"
+ 
+#Annotating site ID as proteinID_position_me1/2/3
+MethylKSites$MethylKSiteID <- str_c(MethylKSites$Protein.group.IDs, MethylKSites$Position, "me1", sep = "_")
+DimethylKSites$DimethylKSiteID <- str_c(DimethylKSites$Protein.group.IDs, DimethylKSites$Position, "me2", sep = "_")
+TrimethylKSites$TrimethylKSiteID <- str_c(TrimethylKSites$Protein.group.IDs, TrimethylKSites$Position, "me3", sep = "_")
+ 
+#Generating columns for site IDs for each methyl state (NAs) 
+MethylKSites$DimethylKSiteID <- NA
+MethylKSites$TrimethylKSiteID <- NA
+DimethylKSites$MethylKSiteID <- NA
+DimethylKSites$TrimethylKSiteID <- NA
+TrimethylKSites$MethylKSiteID <- NA
+TrimethylKSites$DimethylKSiteID <- NA
+
+```
+
+```{r}
+##Function to convert empty vector to NA (as a character)
+
+EmptyVectorToNA <- function(x)
+{
+  if(length(x) == 0L)
+    {
+      x <- as.character(NA)
+    }
+  return(x)
+}
+
+```
+
+```{r}
+##Function to integrate mono, di and tri-methyl sites to create master site table
+
+Join.MethylK.Site.Tables <- function(Fun_MethylKTable, Fun_DimethylKTable, Fun_TrimethylKTable)
+{
+  
+#Selecting relevant columns
+  
+TempMethylKSites <- Fun_MethylKTable %>%
+  select(Proteins,Protein.group.IDs,Position,MethylKSiteID,DimethylKSiteID,TrimethylKSiteID, Peptide.IDs, MS.MS.IDs, Sequence.window)
+TempDimethylKSites <- Fun_DimethylKTable %>%
+  select(Proteins,Protein.group.IDs,Position,MethylKSiteID,DimethylKSiteID,TrimethylKSiteID, Peptide.IDs, MS.MS.IDs, Sequence.window)
+TempTrimethylKSites <- Fun_TrimethylKTable %>%
+  select(Proteins,Protein.group.IDs,Position,MethylKSiteID,DimethylKSiteID,TrimethylKSiteID, Peptide.IDs, MS.MS.IDs, Sequence.window)
+
+#Integrating tables
+
+JoinedMethylKSites <- rbind(TempMethylKSites, TempDimethylKSites, TempTrimethylKSites)
+
+JoinedMethylKSites <- JoinedMethylKSites %>%
+  group_by (Proteins, Protein.group.IDs, Position) %>%     #Sites grouped by protein/protein group ID and site position
+  summarise(MethylKSiteID = EmptyVectorToNA(na.omit(MethylKSiteID)),         #Only 1 row in each group will have a site ID for each of the methyl states;
+            DimethylKSiteID = EmptyVectorToNA(na.omit(DimethylKSiteID)),     #If no IDs are present, EmptyVectorToNA converts the empty vector to NA to be 
+            TrimethylKSiteID = EmptyVectorToNA(na.omit(TrimethylKSiteID)),   #of the correct length (1) for the summarise function
+            Peptide.IDs = str_c(Peptide.IDs,sep = ";", collapse = ";"),      #Joining peptide IDs from each methyl state
+            MS.MS.IDs = str_c(MS.MS.IDs,sep = ";", collapse = ";"),          #Joining MSMS IDs from each methyl state
+            Sequence.window = str_replace_all(unique(Sequence.window), "_", "-")) %>%
+  ungroup()
+
+#Removing redundant Peptide.IDs
+JoinedMethylKSites$Peptide.IDs <- str_split(JoinedMethylKSites$Peptide.IDs, ";")
+for(i in 1:nrow(JoinedMethylKSites)){
+  JoinedMethylKSites$Peptide.IDs[[i]] <- paste(unique(JoinedMethylKSites$Peptide.IDs[[i]]),collapse = ";")
+}
+
+#Counting the number of methylation states seen
+JoinedMethylKSites$NumberOfMethylationStates <- rowSums(
+    !is.na(
+      JoinedMethylKSites[,c("MethylKSiteID","DimethylKSiteID","TrimethylKSiteID")]
+    )
+  )
+
+#Counting the number of peptides for the methylation site
+JoinedMethylKSites$Number.Of.Peptides <- str_count(JoinedMethylKSites$Peptide.IDs,";") + 1
+
+#Is Giardia?
+JoinedMethylKSites$IsGiardia <- str_detect(JoinedMethylKSites$Proteins,"GL50803")
+
+return(JoinedMethylKSites)
+
+}
+
+```
+
+```{r}
+##Generating AllMethylKSites table (unfiltered sites)
+
+AllMethylKSites <- Join.MethylK.Site.Tables(MethylKSites, DimethylKSites, TrimethylKSites)
+
+```
+
+```{r}
+#Getting MSMS info only for those with methylK sites identified (on the MSMS level)
+
+AllMethylKMSMS <- msms %>%
+  filter(Methyl..K. >= 1 | Dimethyl..K. >= 1 | Trimethyl..K. >= 1)
+
+#Generating true delta scores for methylK MSMS matches
+
+MSMSDeltaScores <- str_split(AllMethylKMSMS$All.scores,";",simplify = TRUE)
+
+AllMethylKMSMS$TrueDeltaScore <- as.numeric(MSMSDeltaScores[,1]) - as.numeric(MSMSDeltaScores[,2])
+
+#MSMS with only 1 score will return NA - reassign as the score
+AllMethylKMSMS$TrueDeltaScore[is.na(AllMethylKMSMS$TrueDeltaScore)] <- as.numeric(AllMethylKMSMS$Score[is.na(AllMethylKMSMS$TrueDeltaScore)])
+
+```
+
+```{r}
+##Getting positions of modification sites in peptides
+
+Get.Peptide.Mod.Positions <- function(ModifiedSequences, ModificationString)
+{
+#Removing underscores in modified sequences
+ModPosVar1 <- str_replace_all(ModifiedSequences, "_","")
+  
+#Splitting modified peptide strings by occurrence of brackets "(" or ")"
+#This gives alternating columns of peptide sequence (odd columns) and modification string (even columns)
+ModPosVar2 <- str_split(ModPosVar1, "\\(|\\)", simplify = TRUE)
+  
+#Extracting modification strings, which occur only in even columns
+Modifications <- ModPosVar2[,c(FALSE,TRUE)]
+  
+#Calculating residue positions for corresponding modifications in Modifications table
+#by creating a corresponding table of sequence distances to the site of the modification
+  
+#Extracting peptide sequences from even columns
+ResidueNumbers <- data.frame(ModPosVar2[,c(TRUE,FALSE)])
+  
+#Converting peptide sequences to lengths of those sequences
+ResidueNumbers <- transmute_all(ResidueNumbers, list(length = ~str_length(.)))
+  
+#Calculating the cumulative sums of peptide sequence lengths across all rows - giving all modification positions across each peptide
+ResidueNumbers <- rowCumsums(as.matrix(ResidueNumbers))
+  
+#Creating empty matrix to populate with modification positions (of chosen modification)
+ModPositionsInPeptide <- matrix(data = "", nrow = nrow(Modifications), ncol = ncol(Modifications))
+
+#Populating matrix with positions (in peptide) of chosen modification (represented by the input ModificationString)
+ModPositionsInPeptide[which(Modifications == ModificationString)] <- ResidueNumbers[which(Modifications == ModificationString)]
+  
+#Condensing to a single comma-separated list of site positions for Output
+ModPosVar4 <- as.data.frame(ModPositionsInPeptide)
+ModPosVar5 <- unite(ModPosVar4, "SitePositions", sep = ",", remove = TRUE)
+ModPosVar6 <- ModPosVar5 %>% 
+  mutate(SitePositions = str_replace_all(SitePositions, ",+",",") )
+OutPutColumn <- ModPosVar6 %>% 
+  mutate(SitePositions = str_replace_all(SitePositions, "^,|,$","") )
+  
+return(OutPutColumn)
+  
+}
+
+```
+
+```{r}
+##Site Mapping at the peptide level using the above "Get.Peptide.Mod.Positions" function
+
+#Replacing K(me) with K(Kme) in order to distinguish it from D(me) and E(me)
+AllMethylKMSMS$Modified.sequence.Altered <- AllMethylKMSMS$Modified.sequence
+AllMethylKMSMS$Modified.sequence.Altered <- str_replace_all(AllMethylKMSMS$Modified.sequence.Altered,"K\\(me\\)","K\\(Kme\\)")
+
+#Mapping mono, di and tri methylation positions in peptides
+AllMethylKMSMS$Pep.Positions.MethylK <- Get.Peptide.Mod.Positions(AllMethylKMSMS$Modified.sequence.Altered, "Kme")
+AllMethylKMSMS$Pep.Positions.DimethylK <- Get.Peptide.Mod.Positions(AllMethylKMSMS$Modified.sequence.Altered, "di")
+AllMethylKMSMS$Pep.Positions.TrimethylK <- Get.Peptide.Mod.Positions(AllMethylKMSMS$Modified.sequence.Altered, "tr")
+
+```
+
+```{r}
+##Matching methylation sites to the fragment ions surrounding the site
+
+#Extracting MSMS fragment ion assignments
+AllMethylKMSMS_FragmentIons <- AllMethylKMSMS %>%
+  select(Matches) %>%
+  mutate(Matches = str_split(Matches, ";"))
+
+#Creating a comma-separated string of all methyl site positions in a peptide (mono di and tri)
+AllPeptideMethylKSites <- bind_cols(AllMethylKMSMS$Pep.Positions.MethylK, AllMethylKMSMS$Pep.Positions.DimethylK, AllMethylKMSMS$Pep.Positions.TrimethylK)
+AllPeptideMethylKSites <- unite(AllPeptideMethylKSites, "SitePositions", sep = ",", remove = TRUE)
+AllPeptideMethylKSites <- AllPeptideMethylKSites %>% 
+    mutate(SitePositions = str_replace_all(SitePositions, ",+",",") )
+AllPeptideMethylKSites <- AllPeptideMethylKSites %>% 
+    mutate(SitePositions = str_replace_all(SitePositions, "^,|,$","") )
+
+#Splitting the site position string into columns
+SitePositionForFragmentIons <- separate(AllPeptideMethylKSites, col = "SitePositions", into = c("V1", "V2", "V3", "V4", "V5", "V6"), sep = ",", fill = "right")
+
+##Matching to B ions
+
+#Creating tables of the right size
+B_After <- SitePositionForFragmentIons
+B_Before <- SitePositionForFragmentIons
+B_After_Bool <- SitePositionForFragmentIons
+B_Before_Bool <- SitePositionForFragmentIons
+
+for(i in 1:length(SitePositionForFragmentIons)) #Interating across columns
+{
+  #Adding a "b" to site position numbers to get the theoretical b-ion before the site ("B_After")
+  B_After[[i]] [!is.na(B_After[[i]])] <- paste(
+    "b",
+    B_After[[i]] [!is.na(B_After[[i]])],
+    sep=""
+    )
+  
+  #Subtracting 1 from site position numbers to get the b-ion after the site, then adding "b" ("B_Before")
+  B_Before[[i]] <- as.numeric(B_Before[[i]]) - 1
+  
+  B_Before[[i]] [!is.na(B_Before[[i]])] <- paste(
+    "b",
+    B_Before[[i]] [!is.na(B_Before[[i]])],
+    sep=""
+  )
+  
+  #Matching b ions
+  
+  for(j in 1:nrow(B_After)) #Interating down rows
+  {
+    if(!is.na(B_After_Bool[[i]][j])) #This ensures that positions in the matrix that do not have fragment ions to look for (and are thus NAs) stay as NAs
+    {
+      #Checking for cases where the modification is at the end of the peptide (when there is no "B_After" ion) and assigning the fragment ion as being "present"
+      if(B_After[[i]][j] == str_c("b", AllMethylKMSMS$Length[[j]]))
+      {
+        B_After_Bool[[i]][j] <- 1
+      } else {
+        #Matching the theoretical "B_After" ion to the observed fragment ions for each MSMS spectrum
+        B_After_Bool[[i]][j] <- as.numeric(B_After[[i]][j] %in% AllMethylKMSMS_FragmentIons$Matches[[j]])
+      }
+    }
+  }
+  
+  for(j in 1:nrow(B_Before)) #Interating down rows
+  {
+    if(!is.na(B_Before_Bool[[i]][j])) #This ensures that positions in the matrix that do not have fragment ions to look for (and are thus NAs) stay as NAs
+    {
+      #Checking for cases where the modification is at the start of the peptide (when there is no "B_Before") and assigning the fragment ion as being "present"
+      if(B_Before[[i]][j] == "b0")
+      {
+        B_Before_Bool[[i]][j] <- 1
+      } else {
+        #Matching the theoretical "B_Before" ion to the observed fragment ions for each MSMS spectrum
+        B_Before_Bool[[i]][j] <- as.numeric(B_Before[[i]][j] %in% AllMethylKMSMS_FragmentIons$Matches[[j]])
+      }
+    }
+  }
+}
+
+##Y ions
+
+Y_After <- SitePositionForFragmentIons
+Y_Before <- SitePositionForFragmentIons
+Y_After_Bool <- SitePositionForFragmentIons
+Y_Before_Bool <- SitePositionForFragmentIons
+
+
+for(i in 1:length(SitePositionForFragmentIons))
+{
+  #Calculating "Y_After" and "Y_Before" ions
+  Y_After[[i]] <- as.numeric(AllMethylKMSMS$Length) - as.numeric(Y_After[[i]])
+  Y_Before[[i]] <- as.numeric(Y_After[[i]]) + 1
+
+  #Adding "y"
+  Y_After[[i]] [!is.na(Y_After[[i]])] <- paste(
+    "y",
+    Y_After[[i]] [!is.na(Y_After[[i]])],
+    sep=""
+    )
+  
+  Y_Before[[i]] [!is.na(Y_Before[[i]])] <- paste(
+    "y",
+    Y_Before[[i]] [!is.na(Y_Before[[i]])],
+    sep=""
+  )
+  
+  #Matching y ions
+  
+  for(j in 1:nrow(Y_After)) #Interating down rows
+  {
+    if(!is.na(Y_After_Bool[[i]][j])) #This ensures that positions in the matrix that do not have fragment ions to look for (and are thus NAs) stay as NAs
+    {
+      #Checking for cases where the modification is at the end of the peptide (when there is no "Y_After" ion) and assigning the fragment ion as being "present"
+      if(Y_After[[i]][j] == "y0")
+      {
+        Y_After_Bool[[i]][j] <- 1
+      } else {
+        #Matching the theoretical "Y_After" ion to the observed fragment ions for each MSMS spectrum
+        Y_After_Bool[[i]][j] <- as.numeric(Y_After[[i]][j] %in% AllMethylKMSMS_FragmentIons$Matches[[j]])
+      }
+    }
+  }
+  
+  for(j in 1:nrow(Y_Before)) #Interating down rows
+  {
+    if(!is.na(Y_Before_Bool[[i]][j])) #This ensures that positions in the matrix that do not have fragment ions to look for (and are thus NAs) stay as NAs
+    {
+      #Checking for cases where the modification is at the end of the peptide (when there is no "Y_Before" ion) and assigning the fragment ion as being "present"
+      if(Y_Before[[i]][j] == str_c("y", AllMethylKMSMS$Length[[j]]))
+      {
+        B_Before_Bool[[i]][j] <- 1
+      } else {
+        #Matching the theoretical "Y_Before" ion to the observed fragment ions for each MSMS spectrum
+        Y_Before_Bool[[i]][j] <- as.numeric(Y_Before[[i]][j] %in% AllMethylKMSMS_FragmentIons$Matches[[j]])
+      }
+    }
+  }
+}
+
+#Converting TRUE/FALSE tables to numeric
+B_Before_Bool <- sapply(B_Before_Bool, as.numeric)
+Y_Before_Bool <- sapply(Y_Before_Bool, as.numeric)
+B_After_Bool <- sapply(B_After_Bool, as.numeric)
+Y_After_Bool <- sapply(Y_After_Bool, as.numeric)
+
+#Calculating number of fragment ions before site and annotating as comma-separated list in the AllMethylKMSMS table
+NumberOfFragmentIonsBefore <- as.data.frame(as.matrix(B_Before_Bool) + as.matrix(Y_Before_Bool))
+
+NumberOfFragmentIonsBefore[is.na(NumberOfFragmentIonsBefore)] <- ""
+
+NumberOfFragmentIonsBefore <- unite(NumberOfFragmentIonsBefore, "Fragment.Ions.Before", sep = ",", remove = TRUE)
+
+NumberOfFragmentIonsBefore <- NumberOfFragmentIonsBefore %>% 
+    mutate(Fragment.Ions.Before = str_replace_all(Fragment.Ions.Before, ",+",",") )
+
+NumberOfFragmentIonsBefore <- NumberOfFragmentIonsBefore %>% 
+    mutate(Fragment.Ions.Before = str_replace_all(Fragment.Ions.Before, "^,|,$","") )
+
+AllMethylKMSMS$Number.Of.Fragment.Ions.Before <- NumberOfFragmentIonsBefore
+
+#Calculating number of fragment ions after site and annotating as comma-separated list in the AllMethylKMSMS table
+
+NumberOfFragmentIonsAfter <- as.data.frame(as.matrix(B_After_Bool) + as.matrix(Y_After_Bool))
+
+NumberOfFragmentIonsAfter[is.na(NumberOfFragmentIonsAfter)] <- ""
+
+NumberOfFragmentIonsAfter <- unite(NumberOfFragmentIonsAfter, "Fragment.Ions.After", sep = ",", remove = TRUE)
+
+NumberOfFragmentIonsAfter <- NumberOfFragmentIonsAfter %>% 
+    mutate(Fragment.Ions.After = str_replace_all(Fragment.Ions.After, ",+",",") )
+
+NumberOfFragmentIonsAfter <- NumberOfFragmentIonsAfter %>% 
+    mutate(Fragment.Ions.After = str_replace_all(Fragment.Ions.After, "^,|,$","") )
+
+AllMethylKMSMS$Number.Of.Fragment.Ions.After <- NumberOfFragmentIonsAfter
+
+```
+
+```{r}
+##Mapping AllMethylKMSMS to protein level sites - and annotating as Site ID
+
+AllMethylKMSMS$Start.position <- NA
+
+#Getting peptide start positions in their proteins from the Peptides MQ output
+for(i in 1:nrow(AllMethylKMSMS))
+{
+ AllMethylKMSMS$Start.position[i] <- Peptides$Start.position[Peptides$id %in% AllMethylKMSMS$Peptide.ID[i]]
+}
+
+#Filling blanks with NAs
+AllMethylKMSMS$Pep.Positions.MethylK[AllMethylKMSMS$Pep.Positions.MethylK == ""] <- NA
+AllMethylKMSMS$Pep.Positions.DimethylK[AllMethylKMSMS$Pep.Positions.DimethylK == ""] <- NA
+AllMethylKMSMS$Pep.Positions.TrimethylK[AllMethylKMSMS$Pep.Positions.TrimethylK == ""] <- NA
+
+#Splitting MSMS spectra with more than 1 methylation site into separate rows for each site
+
+AllMethylKMSMS <- as.data.frame(cSplit(as.matrix(AllMethylKMSMS), "Pep.Positions.MethylK", sep = ",", direction = "long"))
+AllMethylKMSMS <- as.data.frame(cSplit(as.matrix(AllMethylKMSMS), "Pep.Positions.DimethylK", sep = ",", direction = "long"))
+AllMethylKMSMS <- as.data.frame(cSplit(as.matrix(AllMethylKMSMS), "Pep.Positions.TrimethylK", sep = ",", direction = "long"))
+
+#Creating columns for the protein positions
+AllMethylKMSMS$MethylK.Protein.Position <- NA
+AllMethylKMSMS$DimethylK.Protein.Position <- NA
+AllMethylKMSMS$TrimethylK.Protein.Position <- NA
+
+#Calculating protein positions based on peptide start positions and modification positions within peptides
+AllMethylKMSMS$MethylK.Protein.Position <- as.numeric(unlist(AllMethylKMSMS$Start.position)) + as.numeric(unlist(AllMethylKMSMS$Pep.Positions.MethylK)) - 1
+AllMethylKMSMS$DimethylK.Protein.Position <- as.numeric(unlist(AllMethylKMSMS$Start.position)) + as.numeric(unlist(AllMethylKMSMS$Pep.Positions.DimethylK)) - 1
+AllMethylKMSMS$TrimethylK.Protein.Position <- as.numeric(unlist(AllMethylKMSMS$Start.position)) + as.numeric(unlist(AllMethylKMSMS$Pep.Positions.TrimethylK)) - 1
+
+#Annotating site ID as proteinID_position_me1/2/3
+AllMethylKMSMS$Methyl..K..site.IDs <- str_c(AllMethylKMSMS$Protein.group.IDs, AllMethylKMSMS$MethylK.Protein.Position, "me1", sep = "_")
+AllMethylKMSMS$Dimethyl..K..site.IDs <- str_c(AllMethylKMSMS$Protein.group.IDs, AllMethylKMSMS$DimethylK.Protein.Position, "me2", sep = "_")
+AllMethylKMSMS$Trimethyl..K..site.IDs <- str_c(AllMethylKMSMS$Protein.group.IDs, AllMethylKMSMS$TrimethylK.Protein.Position, "me3", sep = "_")
+
+```
+
+```{r}
+##Function for mapping filtered MSMS table back to the Separate methylation site tables (mono, di, tri) and then combining to the FilteredMethylKSite table
+
+Map.Filtered.MSMS.Back.To.Site.Tables <- function(FilteredMSMS)
+{
+  
+#Grouping MSMS by site IDs and concatenating unique peptide and MSMS IDs - to generate table matching site IDs to peptide and MSMS IDs
+MethylK_Grouped_Peptide_and_MSMS_IDs <- FilteredMSMS %>%
+  group_by(Methyl..K..site.IDs) %>%
+  summarise(
+    Peptide.ID = str_c(
+         unique(
+            unlist(str_split(str_trim(Peptide.ID, side = "both"), ";"))
+               ), sep = ";", collapse = ";")
+  ,
+  MS.MS.IDs = str_c(str_trim(MS.MS.IDs, side = "both"), sep = ";", collapse = ";")
+  ) %>%
+  ungroup()
+
+DimethylK_Grouped_Peptide_and_MSMS_IDs <- FilteredMSMS %>%
+  group_by(Dimethyl..K..site.IDs) %>%
+  summarise(
+    Peptide.ID = str_c(
+         unique(
+            unlist(str_split(str_trim(Peptide.ID, side = "both"), ";"))
+               ), sep = ";", collapse = ";")
+  ,
+  MS.MS.IDs = str_c(str_trim(MS.MS.IDs, side = "both"), sep = ";", collapse = ";")
+  ) %>%
+  ungroup()
+
+TrimethylK_Grouped_Peptide_and_MSMS_IDs <- FilteredMSMS %>%
+  group_by(Trimethyl..K..site.IDs) %>%
+  summarise(
+    Peptide.ID = str_c(
+         unique(
+            unlist(str_split(str_trim(Peptide.ID, side = "both"), ";"))
+               ), sep = ";", collapse = ";")
+  ,
+  MS.MS.IDs = str_c(str_trim(MS.MS.IDs, side = "both"), sep = ";", collapse = ";")
+  ) %>%
+  ungroup()
+  
+
+#Creating a list of unique site IDs in the filtered MSMS data
+Fun_Filtered_MethylKMSMS_SiteIDs <- unique(unlist(na.omit(FilteredMSMS$Methyl..K..site.IDs)))
+Fun_Filtered_DimethylKMSMS_SiteIDs <- unique(unlist(na.omit(FilteredMSMS$Dimethyl..K..site.IDs)))
+Fun_Filtered_TrimethylKMSMS_SiteIDs <- unique(unlist(na.omit(FilteredMSMS$Trimethyl..K..site.IDs)))
+
+#Creating filtered site tables - only taking rows where the site ID is found in the list of site IDs in the filtered MSMS table
+Filtered.MethylK.Site.Table <- MethylKSites %>%
+  filter(MethylKSites$MethylKSiteID %in% Fun_Filtered_MethylKMSMS_SiteIDs)
+
+Filtered.DimethylK.Site.Table <- DimethylKSites %>%
+  filter(DimethylKSites$DimethylKSiteID %in% Fun_Filtered_DimethylKMSMS_SiteIDs)
+
+Filtered.TrimethylK.Site.Table <- TrimethylKSites %>%
+  filter(TrimethylKSites$TrimethylKSiteID %in% Fun_Filtered_TrimethylKMSMS_SiteIDs)
+
+#Populating filtered site tables with their corresponding peptide IDs
+
+Filtered.MethylK.Site.Table$Peptide.IDs <- MethylK_Grouped_Peptide_and_MSMS_IDs$Peptide.ID[
+  pmatch(
+    Filtered.MethylK.Site.Table$MethylKSiteID, MethylK_Grouped_Peptide_and_MSMS_IDs$Methyl..K..site.IDs
+    )
+  ]
+
+Filtered.DimethylK.Site.Table$Peptide.IDs <- DimethylK_Grouped_Peptide_and_MSMS_IDs$Peptide.ID[
+  pmatch(
+    Filtered.DimethylK.Site.Table$DimethylKSiteID, DimethylK_Grouped_Peptide_and_MSMS_IDs$Dimethyl..K..site.IDs
+    )
+  ]
+
+Filtered.TrimethylK.Site.Table$Peptide.IDs <- TrimethylK_Grouped_Peptide_and_MSMS_IDs$Peptide.ID[
+  pmatch(
+    Filtered.TrimethylK.Site.Table$TrimethylKSiteID, TrimethylK_Grouped_Peptide_and_MSMS_IDs$Trimethyl..K..site.IDs
+    )
+  ]
+
+#Populating filtered site tables with their corresponding MSMS IDs
+
+Filtered.MethylK.Site.Table$MS.MS.IDs <- MethylK_Grouped_Peptide_and_MSMS_IDs$MS.MS.IDs[
+  pmatch(
+    Filtered.MethylK.Site.Table$MethylKSiteID, MethylK_Grouped_Peptide_and_MSMS_IDs$Methyl..K..site.IDs
+    )
+  ]
+
+Filtered.DimethylK.Site.Table$MS.MS.IDs <- DimethylK_Grouped_Peptide_and_MSMS_IDs$MS.MS.IDs[
+  pmatch(
+    Filtered.DimethylK.Site.Table$DimethylKSiteID, DimethylK_Grouped_Peptide_and_MSMS_IDs$Dimethyl..K..site.IDs
+    )
+  ]
+
+Filtered.TrimethylK.Site.Table$MS.MS.IDs <- TrimethylK_Grouped_Peptide_and_MSMS_IDs$MS.MS.IDs[
+  pmatch(
+    Filtered.TrimethylK.Site.Table$TrimethylKSiteID, TrimethylK_Grouped_Peptide_and_MSMS_IDs$Trimethyl..K..site.IDs
+    )
+  ]
+
+#Integrating mono, di and tri-methyl sites to create master site table
+
+Fun_AllMethylKSites <- Join.MethylK.Site.Tables(Filtered.MethylK.Site.Table, Filtered.DimethylK.Site.Table, Filtered.TrimethylK.Site.Table)
+
+return(Fun_AllMethylKSites)
+
+}
+
+```
+
+```{r}
+##Methylation site filtering function - takes an MSMS table, which it then filters according to the MSMS-level filtering settings given.
+##This filtered MSMS table is then mapped back to the site tables, outputting a master site table, which is then
+##filtered according to the site-level filtering settings given.
+
+MethylK.Site.Filtering <- function(MSMSTable, Fun_ScoreCutOff = 100, Fun_TrueDeltaScoreCutOff = 20, Fun_DeltaScoreCutOff = 40, Fun_LocalisationCutOff = 0.95, Fun_PeptideLengthCutOff = 20, Fun_FragmentIonsBeforeAndAfter = 1, Fun_RemoveCoModifiedWithMetDE = TRUE, Fun_NumberOfMethylationStates = 1, Fun_NumberOfPeptides = 1, IsGiardia = FALSE)
+{
+#MSMS-level filtering
+Fun_FilteredMSMS <- MSMSTable %>%
+  filter(
+    as.numeric(Score) >= Fun_ScoreCutOff &
+    as.numeric(TrueDeltaScore) >= Fun_TrueDeltaScoreCutOff &
+    as.numeric(Delta.score) >= Fun_DeltaScoreCutOff &
+    as.numeric(Localization.prob) >= Fun_LocalisationCutOff &
+    as.numeric(Length) <= Fun_PeptideLengthCutOff &
+    #For peptides with multiple methylation sites, the site with the least number of fragment ions before/after is used for the comparison.
+    #This ensures that all sites within the peptide have at least that many fragment ions before/after.
+    lapply(str_split(MSMSTable$Number.Of.Fragment.Ions.Before, ","), min) >= Fun_FragmentIonsBeforeAndAfter &
+    lapply(str_split(MSMSTable$Number.Of.Fragment.Ions.After, ","), min) >= Fun_FragmentIonsBeforeAndAfter
+  )
+
+if(Fun_RemoveCoModifiedWithMetDE == TRUE)
+{
+  Fun_FilteredMSMS <- Fun_FilteredMSMS %>%
+    filter(Methyl..DE. == 0)
+}
+
+FilteredMethylKMSMS <<- Fun_FilteredMSMS
+
+if(nrow(Fun_FilteredMSMS) >= 1) #Catching when the MSMS filtering returns an empty table
+{
+  #Mapping back to master site table
+  MSMSFiltered_MethylKSites <- Map.Filtered.MSMS.Back.To.Site.Tables(Fun_FilteredMSMS)
+  
+  #Site-level filtering
+  SiteLevelFiltered_MethylKSites <- MSMSFiltered_MethylKSites %>%
+    filter(
+      as.numeric(MSMSFiltered_MethylKSites$NumberOfMethylationStates) >= Fun_NumberOfMethylationStates &
+      as.numeric(MSMSFiltered_MethylKSites$Number.Of.Peptides) >= Fun_NumberOfPeptides
+    )
+  
+  if(IsGiardia == TRUE)
+  {
+    SiteLevelFiltered_MethylKSites <- SiteLevelFiltered_MethylKSites %>%
+      filter(
+        SiteLevelFiltered_MethylKSites$IsGiardia == TRUE
+      )
+  }
+  
+  return(SiteLevelFiltered_MethylKSites)
+} else { return("No MSMS spectra passed filtering") }
+
+}
+
+```
+
+```{r}
+##Running filterings
+
+#Low stringency
+Low_stringency_MethylKsites <- MethylK.Site.Filtering(AllMethylKMSMS,
+    Fun_ScoreCutOff = 60,
+    Fun_TrueDeltaScoreCutOff = 10,
+    Fun_DeltaScoreCutOff = 0,
+    Fun_LocalisationCutOff = .95,
+    Fun_PeptideLengthCutOff = 20,
+    Fun_FragmentIonsBeforeAndAfter = 1,
+    Fun_RemoveCoModifiedWithMetDE = TRUE,
+    Fun_NumberOfMethylationStates = 1,
+    Fun_NumberOfPeptides = 1,
+    IsGiardia = TRUE
+  )
+
+#High stringency
+High_stringency_MethylKsites <- MethylK.Site.Filtering(AllMethylKMSMS,
+    Fun_ScoreCutOff = 100,
+    Fun_TrueDeltaScoreCutOff = 20,
+    Fun_DeltaScoreCutOff = 0,
+    Fun_LocalisationCutOff = .95,
+    Fun_PeptideLengthCutOff = 20,
+    Fun_FragmentIonsBeforeAndAfter = 1,
+    Fun_RemoveCoModifiedWithMetDE = TRUE,
+    Fun_NumberOfMethylationStates = 2,
+    Fun_NumberOfPeptides = 1,
+    IsGiardia = TRUE
+  )
+
+#All 4 fragment ions next to site
+Site_Fragment_Ion_Filter_MethylKsites <- MethylK.Site.Filtering(AllMethylKMSMS,
+    Fun_ScoreCutOff = 0,
+    Fun_TrueDeltaScoreCutOff = 0,
+    Fun_DeltaScoreCutOff = 0,
+    Fun_LocalisationCutOff = 0,
+    Fun_PeptideLengthCutOff = 100,
+    Fun_FragmentIonsBeforeAndAfter = 2,
+    Fun_RemoveCoModifiedWithMetDE = FALSE,
+    Fun_NumberOfMethylationStates = 1,
+    Fun_NumberOfPeptides = 1,
+    IsGiardia = TRUE
+  )
+
+write.csv(apply(AllMethylKMSMS,2,as.character), file = "AllMethylKMSMS.csv")
+
+write.csv(apply(Low_stringency_MethylKsites,2,as.character), file = "Low_stringency_MethylKsites.csv")
+write.csv(apply(High_stringency_MethylKsites,2,as.character), file = "High_stringency_MethylKsites.csv")
+write.csv(apply(Site_Fragment_Ion_Filter_MethylKsites,2,as.character), file = "Site_Fragment_Ion_Filter_MethylKsites.csv")
+
+
+```
+
+```
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
